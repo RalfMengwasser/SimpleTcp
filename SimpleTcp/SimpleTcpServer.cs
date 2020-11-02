@@ -96,13 +96,13 @@ namespace SimpleTcp
         /// <summary>
         /// Method to invoke to send a log message.
         /// </summary>
-        public Action<string> Logger = null;
+        public Action<string, TCPLogType> Logger = null;
 
         #endregion
 
         #region Private-Members
 
-        private string _Header = "[SimpleTcp.Server] ";
+        private string _Header = "[TCP] ";
         private SimpleTcpServerSettings _Settings = new SimpleTcpServerSettings();
         private SimpleTcpServerEvents _Events = new SimpleTcpServerEvents();
         private SimpleTcpKeepaliveSettings _Keepalive = new SimpleTcpKeepaliveSettings();
@@ -143,7 +143,6 @@ namespace SimpleTcp
         /// <param name="pfxPassword">The password to the PFX certificate file.</param>
         public SimpleTcpServer(string listenerIp, int port, bool ssl, string pfxCertFilename, string pfxPassword)
         {
-            if (String.IsNullOrEmpty(listenerIp)) throw new ArgumentNullException(nameof(listenerIp));
             if (port < 0) throw new ArgumentException("Port must be zero or greater.");
              
             if (String.IsNullOrEmpty(listenerIp))
@@ -254,7 +253,7 @@ namespace SimpleTcp
             _Listener.Stop();
             _TokenSource.Cancel();
 
-            Logger?.Invoke(_Header + "stopped");
+            Logger?.Invoke(_Header + "stopped", TCPLogType.Info);
         }
 
         /// <summary>
@@ -289,7 +288,15 @@ namespace SimpleTcp
         {
             if (String.IsNullOrEmpty(ipPort)) throw new ArgumentNullException(nameof(ipPort));
             if (String.IsNullOrEmpty(data)) throw new ArgumentNullException(nameof(data));
+
+            var c = GetSocket(ipPort);
             byte[] bytes = Encoding.UTF8.GetBytes(data);
+
+            if (c != null && c.IsWebSocket)
+            {
+                bytes = EncodeWebSocketMessage(bytes);
+            }
+
             MemoryStream ms = new MemoryStream();
             ms.Write(bytes, 0, bytes.Length);
             ms.Seek(0, SeekOrigin.Begin);
@@ -305,6 +312,14 @@ namespace SimpleTcp
         {
             if (String.IsNullOrEmpty(ipPort)) throw new ArgumentNullException(nameof(ipPort));
             if (data == null || data.Length < 1) throw new ArgumentNullException(nameof(data));
+
+            var c = GetSocket(ipPort);
+
+            if (c != null && c.IsWebSocket)
+            {
+                data = EncodeWebSocketMessage(data);
+            }
+
             MemoryStream ms = new MemoryStream();
             ms.Write(data, 0, data.Length);
             ms.Seek(0, SeekOrigin.Begin);
@@ -335,7 +350,15 @@ namespace SimpleTcp
         {
             if (String.IsNullOrEmpty(ipPort)) throw new ArgumentNullException(nameof(ipPort));
             if (String.IsNullOrEmpty(data)) throw new ArgumentNullException(nameof(data));
+
+            var c = GetSocket(ipPort);
             byte[] bytes = Encoding.UTF8.GetBytes(data);
+
+            if (c != null && c.IsWebSocket)
+            {
+                bytes = EncodeWebSocketMessage(bytes);
+            }
+
             MemoryStream ms = new MemoryStream();
             await ms.WriteAsync(bytes, 0, bytes.Length);
             ms.Seek(0, SeekOrigin.Begin);
@@ -351,6 +374,14 @@ namespace SimpleTcp
         {
             if (String.IsNullOrEmpty(ipPort)) throw new ArgumentNullException(nameof(ipPort));
             if (data == null || data.Length < 1) throw new ArgumentNullException(nameof(data));
+
+            var c = GetSocket(ipPort);
+
+            if (c != null && c.IsWebSocket)
+            {
+                data = EncodeWebSocketMessage(data);
+            }
+
             MemoryStream ms = new MemoryStream();
             await ms.WriteAsync(data, 0, data.Length);
             ms.Seek(0, SeekOrigin.Begin);
@@ -378,29 +409,269 @@ namespace SimpleTcp
         /// <param name="ipPort">IP:port of the client.</param>
         public void DisconnectClient(string ipPort)
         {
-            if (String.IsNullOrEmpty(ipPort)) throw new ArgumentNullException(nameof(ipPort));
+            try
+            {
+                var c = GetSocket(ipPort);
 
-            if (!_Clients.TryGetValue(ipPort, out ClientMetadata client))
-            {
-                Logger?.Invoke(_Header + "unable to find client: " + ipPort); 
-            }
-            else
-            {
-                if (!_ClientsTimedout.ContainsKey(ipPort))
+                if (c != null)
                 {
-                    Logger?.Invoke(_Header + "kicking: " + ipPort); 
-                    _ClientsKicked.TryAdd(ipPort, DateTime.Now);
-                }
+                    if (!_ClientsTimedout.ContainsKey(ipPort))
+                    {
+                        Logger?.Invoke(_Header + "kicking: " + ipPort, TCPLogType.Debug);
+                        _ClientsKicked.TryAdd(ipPort, DateTime.Now);
+                    }
 
-                _Clients.TryRemove(client.IpPort, out ClientMetadata destroyed);
-                client.Dispose(); 
-                Logger?.Invoke(_Header + "disposed: " + ipPort); 
+                    _Clients.TryRemove(c.IpPort, out ClientMetadata destroyed);
+                    c.Dispose();
+                    Logger?.Invoke(_Header + "disposed: " + ipPort, TCPLogType.Debug);
+
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger?.Invoke(_Header + ex.Message, TCPLogType.Error);
+            }
+        }
+
+        public void DowngradeFromWebSocket(string ipPort)
+        {
+            try
+            {
+                var c = GetSocket(ipPort);
+
+                if (c != null)
+                    c.IsWebSocket = false;
+            }
+            catch (Exception ex)
+            {
+                Logger?.Invoke(_Header + ex.Message, TCPLogType.Error);
+            }
+        }
+
+        public bool CheckUpgradeToWebSocket(string ipPort, string Message)
+        {
+            try
+            {
+                var c = GetSocket(ipPort);
+
+                if (c != null && !c.IsWebSocket)
+                {
+                    string NewMessageToUpper = Message.ToUpper();
+
+                    if (NewMessageToUpper.Contains("UPGRADE: WEBSOCKET") && NewMessageToUpper.Contains("SEC-WEBSOCKET-KEY: "))
+                    {
+                        using (var crypto = System.Security.Cryptography.SHA1.Create())
+                        {
+                            string SecurityKeyReply = Convert.ToBase64String(crypto.ComputeHash(Encoding.UTF8.GetBytes(
+                                   new System.Text.RegularExpressions.Regex("Sec-WebSocket-Key: ?(.*)", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Match(Message).Groups[1].Value.Trim() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+
+                            string data = "HTTP/1.1 101 Switching Protocols\r\n" +
+                                          "Upgrade: websocket\r\n" +
+                                          "Connection: Upgrade\r\n" +
+                                          "Sec-WebSocket-Accept: " + SecurityKeyReply +
+                                          //"Sec-WebSocket-Extensions: " + "\r\n" +
+                                          "\r\n\r\n";
+
+                            string ip = new System.Text.RegularExpressions.Regex("x-forwarded-for: ?(.*)", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Match(Message).Groups[1].Value.Trim();
+                            IPEndPoint e = (c.Client.Client.RemoteEndPoint as IPEndPoint);
+                            string origip = e.Address.ToString();
+
+                            if (!string.IsNullOrWhiteSpace(ip) && ip != origip)
+                            {
+                                c.IsProxied = true;
+                                c.OriginalIP = IPAddress.Parse(ip);
+                                c.OriginalDestPort = e.Port;
+                            }
+
+                            Send(ipPort, data);
+                            c.IsWebSocket = true;
+
+                            //Debug.WriteLine("\r\nWebSocket Request:\r\n\r\n" + Message + "WebSocket Handshake Reply:\r\n\r\n" + data);
+
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger?.Invoke(_Header + ex.Message, TCPLogType.Error);
+            }
+
+            return false;
+        }
+        public bool IsWebSocket(string ipPort)
+        {
+            try
+            {
+                var c = GetSocket(ipPort);
+
+                if (c != null)
+                    return c.IsWebSocket;
+            }
+            catch (Exception ex)
+            {
+                Logger?.Invoke(_Header + ex.Message, TCPLogType.Error);
+            }
+
+            return false;
+        }
+        public Protocol GetClientProtocol(string ipPort)
+        {
+            try
+            {
+                var c = GetSocket(ipPort);
+
+                if (c != null)
+                    return c.IncomingProtocol;
+            }
+            catch (Exception ex)
+            {
+                Logger?.Invoke(_Header + ex.Message, TCPLogType.Error);
+            }
+
+            return Protocol.Unknown;
+        }
+        public void SetClientProtocol(string ipPort, Protocol NewProtocol)
+        {
+            try
+            {
+                var c = GetSocket(ipPort);
+
+                if (c != null)
+                    c.IncomingProtocol = NewProtocol;
+            }
+            catch (Exception ex)
+            {
+                Logger?.Invoke(_Header + ex.Message, TCPLogType.Error);
             }
         }
 
         #endregion
 
         #region Private-Methods
+
+        private static WebSocketFrame DecodeWebSocketMessage(byte[] message)
+        {
+            WebSocketFrame frame = new WebSocketFrame();
+
+            int FrameLength = 0;
+            int DecodePasswordIndex = 0;
+
+            frame.FinFlag = (message[0] & 128) != 0;
+            frame.RSV1Flag = (message[0] & 64) != 0;
+            frame.RSV2Flag = (message[0] & 32) != 0;
+            frame.RSV3Flag = (message[0] & 16) != 0;
+            frame.OpCode = (message[0] & 0xF);
+            frame.Masked = (message[1] & 128) != 0;
+            frame.Length = (message[1] - 128);
+
+            // If not masked, messages are invalid and normally should disconnect
+            if (!frame.Masked)
+            {
+                return null;
+            }
+
+            if (frame.Length <= 125)
+            {
+                DecodePasswordIndex = 2;
+                FrameLength = frame.Length + 6;
+            }
+            else if (frame.Length == 126)
+            {
+                frame.Length = BitConverter.ToInt16(new byte[] { message[3], message[2] }, 0);
+                DecodePasswordIndex = 4;
+                FrameLength = frame.Length + 8;
+            }
+            else if (frame.Length == 127)
+            {
+                frame.Length = (int)BitConverter.ToInt64(new byte[] { message[9], message[8], message[7], message[6], message[5], message[4], message[3], message[2] }, 0);
+                DecodePasswordIndex = 10;
+                FrameLength = frame.Length + 14;
+            }
+
+            if (message.Length < FrameLength)
+                return null;
+
+            byte[] DecodePassword = new byte[] { message[DecodePasswordIndex], message[DecodePasswordIndex + 1], message[DecodePasswordIndex + 2], message[DecodePasswordIndex + 3] };
+
+            int count = 0;
+            for (int i = DecodePasswordIndex + 4; i < FrameLength; i++)
+            {
+                message[i] = (byte)(message[i] ^ DecodePassword[count % 4]);
+                count++;
+            }
+
+            frame.Message = ASCIIEncoding.UTF8.GetString(message, DecodePasswordIndex + 4, frame.Length) + "\r\n";
+
+            return frame;
+        }
+        private static byte[] EncodeWebSocketMessage(byte[] message)
+        {
+            int FrameLength;
+            int DecodePasswordIndex;
+            byte[] res;
+
+            if (message.Length <= 125)
+            {
+                DecodePasswordIndex = 2;
+                FrameLength = message.Length + 2;
+                res = new byte[FrameLength];
+
+                res[0] = 129;
+                res[1] = (byte)message.Length;
+            }
+            else if (message.Length <= 65535)
+            {
+                DecodePasswordIndex = 4;
+                FrameLength = message.Length + 4;
+                res = new byte[FrameLength];
+
+                res[0] = 129;
+                res[1] = (byte)126;
+                res[2] = (byte)((message.Length & 0xFF00) >> 8);
+                res[3] = (byte)(message.Length & 0xFF);
+            }
+            else
+            {
+                DecodePasswordIndex = 10;
+                FrameLength = message.Length + 10;
+                res = new byte[FrameLength];
+
+                res[0] = 129;
+                res[1] = (byte)127;
+                res[2] = 0;
+                res[3] = 0;
+                res[4] = 0;
+                res[5] = 0;
+                res[6] = (byte)((message.Length & 0xFF000000) >> 24);
+                res[7] = (byte)((message.Length & 0xFF0000) >> 16);
+                res[8] = (byte)((message.Length & 0xFF00) >> 8);
+                res[9] = (byte)(message.Length & 0xFF);
+            }
+
+            int count = 0;
+            for (int i = DecodePasswordIndex; i < FrameLength; i++)
+            {
+                res[i] = (byte)message[count];
+                count++;
+            }
+
+            return res;
+        }
+
+        private ClientMetadata GetSocket(string ipPort)
+        {
+            if (!_Clients.TryGetValue(ipPort, out ClientMetadata client))
+            {
+                Logger?.Invoke(_Header + "unable to find client: " + ipPort, TCPLogType.Warn);
+                return null;
+            }
+            else
+            {
+                return client;
+            }
+        }
 
         /// <summary>
         /// Dispose of the TCP server.
@@ -417,7 +688,7 @@ namespace SimpleTcp
                         foreach (KeyValuePair<string, ClientMetadata> curr in _Clients)
                         {
                             curr.Value.Dispose();
-                            Logger?.Invoke(_Header + "disconnected client: " + curr.Key);
+                            Logger?.Invoke(_Header + "disconnected client: " + curr.Key, TCPLogType.Debug);
                         } 
                     }
 
@@ -440,12 +711,12 @@ namespace SimpleTcp
                     Logger?.Invoke(_Header + "dispose exception:" +
                         Environment.NewLine +
                         e.ToString() +
-                        Environment.NewLine);
+                        Environment.NewLine, TCPLogType.Error);
                 }
 
                 _IsListening = false;
 
-                Logger?.Invoke(_Header + "disposed");
+                Logger?.Invoke(_Header + "disposed", TCPLogType.Debug);
             }
         }
          
@@ -512,7 +783,7 @@ namespace SimpleTcp
 
                     _Clients.TryAdd(clientIp, client); 
                     _ClientsLastSeen.TryAdd(clientIp, DateTime.Now); 
-                    Logger?.Invoke(_Header + "starting data receiver for: " + clientIp); 
+                    Logger?.Invoke(_Header + "starting data receiver for: " + clientIp, TCPLogType.Debug); 
                     _Events.HandleClientConnected(this, new ClientConnectedEventArgs(clientIp)); 
                     Task unawaited = Task.Run(() => DataReceiver(client), _Token);
                 }
@@ -530,7 +801,7 @@ namespace SimpleTcp
                 catch (Exception e)
                 {
                     if (client != null) client.Dispose();
-                    Logger?.Invoke(_Header + "exception while awaiting connections: " + e.ToString());
+                    Logger?.Invoke(_Header + "exception while awaiting connections: " + e.ToString(), TCPLogType.Error);
                     continue;
                 } 
             }
@@ -550,28 +821,28 @@ namespace SimpleTcp
 
                 if (!client.SslStream.IsEncrypted)
                 {
-                    Logger?.Invoke(_Header + "client " + client.IpPort + " not encrypted, disconnecting");
+                    Logger?.Invoke(_Header + "client " + client.IpPort + " not encrypted, disconnecting", TCPLogType.Debug);
                     client.Dispose();
                     return false;
                 }
 
                 if (!client.SslStream.IsAuthenticated)
                 {
-                    Logger?.Invoke(_Header + "client " + client.IpPort + " not SSL/TLS authenticated, disconnecting");
+                    Logger?.Invoke(_Header + "client " + client.IpPort + " not SSL/TLS authenticated, disconnecting", TCPLogType.Debug);
                     client.Dispose();
                     return false;
                 }
 
                 if (_Settings.MutuallyAuthenticate && !client.SslStream.IsMutuallyAuthenticated)
                 {
-                    Logger?.Invoke(_Header + "client " + client.IpPort + " failed mutual authentication, disconnecting");
+                    Logger?.Invoke(_Header + "client " + client.IpPort + " failed mutual authentication, disconnecting", TCPLogType.Debug);
                     client.Dispose();
                     return false;
                 }
             }
             catch (Exception e)
             {
-                Logger?.Invoke(_Header + "client " + client.IpPort + " SSL/TLS exception: " + Environment.NewLine + e.ToString());
+                Logger?.Invoke(_Header + "client " + client.IpPort + " SSL/TLS exception: " + Environment.NewLine + e.ToString(), TCPLogType.Error);
                 client.Dispose();
                 return false;
             }
@@ -587,7 +858,7 @@ namespace SimpleTcp
 
         private async Task DataReceiver(ClientMetadata client)
         {
-            Logger?.Invoke(_Header + "data receiver started for client " + client.IpPort);
+            Logger?.Invoke(_Header + "data receiver started for client " + client.IpPort, TCPLogType.Debug);
             
             while (true)
             {
@@ -596,43 +867,105 @@ namespace SimpleTcp
                     if (client.Token.IsCancellationRequested 
                         || !IsClientConnected(client.Client))
                     {
-                        Logger?.Invoke(_Header + "client " + client.IpPort + " disconnected");
+                        Logger?.Invoke(_Header + "client " + client.IpPort + " disconnected", TCPLogType.Debug);
                         break;
                     }
 
                     if (client.Token.IsCancellationRequested)
                     {
-                        Logger?.Invoke(_Header + "cancellation requested (data receiver for client " + client.IpPort + ")");
+                        Logger?.Invoke(_Header + "cancellation requested (data receiver for client " + client.IpPort + ")", TCPLogType.Debug);
                         break;
                     } 
 
-                    byte[] data = await DataReadAsync(client);
-                    if (data == null)
+                    byte[] m_Buffer = await DataReadAsync(client);
+                    if (m_Buffer == null)
                     { 
                         await Task.Delay(30);
                         continue;
                     }
 
-                    _Events.HandleDataReceived(this, new DataReceivedFromClientEventArgs(client.IpPort, data));
-                    _Statistics.ReceivedBytes += data.Length;
+                    int BufferStart = 0;
+                    int nBytesRec = m_Buffer.Length;
+
+                    // We support the PROXY protocol (currently v1)
+                    // PROXY TCP4 192.168.0.37 192.168.0.121 57307 16248\r\n
+                    // PROXY TCP6 ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\n
+                    // \x0D \x0A \x0D \x0A \x00 \x0D \x0A \x51 \x55 \x49 \x54 \x0A
+                    // Min 32 bytes, max 108 bytes
+                    if (nBytesRec > 32 && m_Buffer[0] == 'P' && m_Buffer[1] == 'R' && m_Buffer[2] == 'O' && m_Buffer[3] == 'X' && m_Buffer[4] == 'Y' && m_Buffer[5] == ' ')
+                    {
+                        try
+                        {
+                            string msg = Encoding.UTF8.GetString(m_Buffer, 0, Math.Min(108, nBytesRec)); // 108 is the max we need to parse
+                            string[] proxy = msg.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                            string[] proxyparts = proxy[0].Split(new string[] { " " }, StringSplitOptions.RemoveEmptyEntries);
+
+                            client.OriginalIP = IPAddress.Parse(proxyparts[2]);
+                            client.OriginalSrcPort = int.Parse(proxyparts[4]);
+                            client.OriginalDestPort = int.Parse(proxyparts[5]);
+
+                            client.IsProxied = true;
+
+                            int split = msg.IndexOf("\r\n");
+
+                            if (split > 32)
+                            {
+                                nBytesRec -= split + 2;
+                                BufferStart = split + 2;
+                            }
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+
+                    byte[] package = new byte[nBytesRec];
+                    Buffer.BlockCopy(m_Buffer, BufferStart, package, 0, nBytesRec);
+
+                    var args = new DataReceivedFromClientEventArgs(client.IpPort, package, client.IncomingProtocol, client.Client.Client.RemoteEndPoint);
+                    args.Data = package;
+                    args.Protocol = client.IncomingProtocol;
+
+                    if (client.IsWebSocket)
+                    {
+                        args.WebSocketFrame = DecodeWebSocketMessage(package);
+
+                        if (args.WebSocketFrame.OpCode == 0x9)
+                        {
+                            package[0] = (byte)((package[0] & 0xF0) + 0xA);
+                            Send(client.IpPort, package);
+
+                            return;
+                        }
+                    }
+
+                    if (client.IsProxied)
+                    {
+                        args.OriginalIP = client.OriginalIP;
+                        args.OriginalSrcPort = client.OriginalSrcPort;
+                        args.OriginalDestPort = client.OriginalDestPort;
+                    }
+
+                    _Events.HandleDataReceived(this, args);
+                    _Statistics.ReceivedBytes += package.Length;
                     UpdateClientLastSeen(client.IpPort);
                 }
                 catch (SocketException)
                 {
-                    Logger?.Invoke(_Header + "data receiver socket exception (disconnection) for " + client.IpPort);
+                    Logger?.Invoke(_Header + "data receiver socket exception (disconnection) for " + client.IpPort, TCPLogType.Debug);
                 }
                 catch (Exception e)
                 {
                     Logger?.Invoke(_Header + "data receiver exception for client " + client.IpPort + ":" +
                         Environment.NewLine +
                         e.ToString() +
-                        Environment.NewLine);
+                        Environment.NewLine, TCPLogType.Warn);
 
                     break;
                 }
             }
 
-            Logger?.Invoke(_Header + "data receiver terminated for client " + client.IpPort);
+            Logger?.Invoke(_Header + "data receiver terminated for client " + client.IpPort, TCPLogType.Debug);
 
             if (_ClientsKicked.ContainsKey(client.IpPort))
             {
@@ -724,14 +1057,14 @@ namespace SimpleTcp
                         if (curr.Value < idleTimestamp)
                         {
                             _ClientsTimedout.TryAdd(curr.Key, DateTime.Now);
-                            Logger?.Invoke(_Header + "disconnecting " + curr.Key + " due to timeout");
+                            Logger?.Invoke(_Header + "disconnecting " + curr.Key + " due to timeout", TCPLogType.Debug);
                             DisconnectClient(curr.Key);
                         }
                     }
                 }
                 catch (Exception e)
                 {
-                    Logger?.Invoke(_Header + "monitor exception: " + e.ToString());
+                    Logger?.Invoke(_Header + "monitor exception: " + e.ToString(), TCPLogType.Error);
                 }
             }
         }
@@ -852,7 +1185,7 @@ namespace SimpleTcp
             }
             catch (Exception)
             {
-                Logger?.Invoke(_Header + "keepalives not supported on this platform, disabled");
+                Logger?.Invoke(_Header + "keepalives not supported on this platform, disabled", TCPLogType.Warn);
             }
         }
 

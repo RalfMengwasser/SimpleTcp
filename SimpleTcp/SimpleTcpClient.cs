@@ -129,7 +129,7 @@ namespace SimpleTcp
 
         private CancellationTokenSource _TokenSource = new CancellationTokenSource();
         private CancellationToken _Token;
-         
+
         #endregion
 
         #region Constructors-and-Factories

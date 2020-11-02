@@ -39,10 +39,26 @@ namespace SimpleTcp
 
         internal CancellationToken Token { get; set; }
 
+        public bool IsWebSocket
+        {
+            get; set;
+        }
+        public bool IsProxied
+        {
+            get; set;
+        }
+        public Protocol IncomingProtocol
+        {
+            get; set;
+        }
+        public IPAddress OriginalIP;
+        public int OriginalSrcPort;
+        public int OriginalDestPort;
+
         #endregion
 
         #region Private-Members
-         
+
         private System.Net.Sockets.TcpClient _TcpClient = null;
         private NetworkStream _NetworkStream = null;
         private SslStream _SslStream = null;
